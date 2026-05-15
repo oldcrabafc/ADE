@@ -11,7 +11,7 @@ from dataset.manifest_service import write_manifest
 from dataset.registry_service import register_dataset
 from shared.client_router import resolve_client_dir
 from shared.errors import validation_error
-from shared.schema import AmountRules, DatasetManifest, ImportResult, IngestProfile, LedgerFieldMapping
+from shared.schema import AmountRules, DatasetManifest, FieldRule, ImportResult, IngestProfile, LedgerFieldMapping
 
 
 def quote_ident(name: str) -> str:
@@ -93,23 +93,6 @@ def load_source_to_temp_table(
             """
         )
         return "source_data"
-    if source_type == "parquet":
-        connection.execute(
-            f"""
-            CREATE OR REPLACE TEMP TABLE source_data AS
-            SELECT * FROM read_parquet({sql_literal(source_path)})
-            """
-        )
-        return "source_data"
-    if source_type == "duckdb":
-        connection.execute(f"ATTACH {sql_literal(source_path)} AS source_db")
-        connection.execute(
-            f"""
-            CREATE OR REPLACE TEMP TABLE source_data AS
-            SELECT * FROM source_db.{quote_ident(source_table)}
-            """
-        )
-        return "source_data"
     raise validation_error(f"不支持的来源类型: {source_type}")
 
 
@@ -150,6 +133,7 @@ class DuckDBCleaningService:
                 source_table_name,
                 profile.field_mapping,
                 profile.amount_rules,
+                profile.field_rules,
                 client_name,
                 fiscal_year,
                 import_batch_id,
@@ -209,6 +193,7 @@ class DuckDBCleaningService:
         source_table_name: str,
         mapping: LedgerFieldMapping,
         amount_rules: AmountRules,
+        field_rules: dict[str, FieldRule],
         client_name: str,
         fiscal_year: int,
         import_batch_id: str,
@@ -218,19 +203,19 @@ class DuckDBCleaningService:
         raw_select_exprs = [
             "ROW_NUMBER() OVER () AS __source_row",
             f"TRY_CAST({quote_ident(mapping.posting_date)} AS DATE) AS posting_date",
-            f"CAST({quote_ident(mapping.voucher_id)} AS VARCHAR) AS voucher_id",
+            _prefixed_expr(field_rules, "voucher_id", f"CAST({quote_ident(mapping.voucher_id)} AS VARCHAR)", "voucher_id"),
             _optional_expr(mapping.voucher_header, "voucher_header"),
             _optional_expr(mapping.company_id, "company_id"),
-            f"CAST({quote_ident(mapping.ac_code)} AS VARCHAR) AS ac_code",
+            _prefixed_expr(field_rules, "ac_code", f"CAST({quote_ident(mapping.ac_code)} AS VARCHAR)", "ac_code"),
             f"CAST({quote_ident(mapping.ac_caption)} AS VARCHAR) AS ac_caption",
             _drcr_expr(mapping, amount_rules),
             _amount_expr(amount_rules),
             _optional_numeric_expr(mapping.lc_amount, "lc_amount"),
-            _optional_expr(mapping.vendor_id, "vendor_id"),
+            _optional_prefixed_expr(field_rules, "vendor_id", mapping.vendor_id, "vendor_id"),
             _optional_expr(mapping.vendor_name, "vendor_name"),
-            _optional_expr(mapping.customer_id, "customer_id"),
+            _optional_prefixed_expr(field_rules, "customer_id", mapping.customer_id, "customer_id"),
             _optional_expr(mapping.customer_name, "customer_name"),
-            f"CAST({quote_ident(mapping.description)} AS VARCHAR) AS description",
+            _prefixed_expr(field_rules, "description", f"CAST({quote_ident(mapping.description)} AS VARCHAR)", "description"),
             f"{sql_literal(client_name)} AS client_name",
             f"{int(fiscal_year)} AS fiscal_year",
             f"{sql_literal(source_file)} AS source_file",
@@ -385,6 +370,36 @@ def _optional_numeric_expr(source: str | None, target: str) -> str:
     return f"TRY_CAST({quote_ident(source)} AS DECIMAL(18, 2)) AS {quote_ident(target)}"
 
 
+def _optional_prefixed_expr(
+    field_rules: dict[str, FieldRule],
+    field_name: str,
+    source: str | None,
+    target: str,
+) -> str:
+    if not source:
+        return f"CAST(NULL AS VARCHAR) AS {quote_ident(target)}"
+    base_expr = f"CAST({quote_ident(source)} AS VARCHAR)"
+    return _prefixed_expr(field_rules, field_name, base_expr, target)
+
+
+def _prefixed_expr(
+    field_rules: dict[str, FieldRule],
+    field_name: str,
+    base_expr: str,
+    target: str,
+) -> str:
+    rule = field_rules.get(field_name)
+    if rule is None or not rule.prefix:
+        return f"{base_expr} AS {quote_ident(target)}"
+    prefix_literal = sql_literal(rule.prefix)
+    return (
+        "CASE "
+        f"WHEN NULLIF(TRIM({base_expr}), '') IS NULL THEN NULL "
+        f"ELSE {prefix_literal} || TRIM({base_expr}) "
+        f"END AS {quote_ident(target)}"
+    )
+
+
 def _drcr_expr(mapping: LedgerFieldMapping, amount_rules: AmountRules) -> str:
     source = mapping.drcr or amount_rules.drcr_field
     if not source:
@@ -430,11 +445,9 @@ def _field_mapping_report(mapping: LedgerFieldMapping) -> list[dict[str, str]]:
 
 def _invalid_row_condition() -> str:
     return """
-    posting_date IS NULL
-    OR NULLIF(TRIM(voucher_id), '') IS NULL
+    NULLIF(TRIM(voucher_id), '') IS NULL
     OR NULLIF(TRIM(ac_code), '') IS NULL
     OR NULLIF(TRIM(ac_caption), '') IS NULL
-    OR NULLIF(TRIM(description), '') IS NULL
     OR rc_amount IS NULL
     """.strip()
 
@@ -442,11 +455,9 @@ def _invalid_row_condition() -> str:
 def _error_message_expr() -> str:
     return """
     TRIM(BOTH '; ' FROM
-        (CASE WHEN posting_date IS NULL THEN 'posting_date 无效或为空; ' ELSE '' END) ||
         (CASE WHEN NULLIF(TRIM(voucher_id), '') IS NULL THEN 'voucher_id 为空; ' ELSE '' END) ||
         (CASE WHEN NULLIF(TRIM(ac_code), '') IS NULL THEN 'ac_code 为空; ' ELSE '' END) ||
         (CASE WHEN NULLIF(TRIM(ac_caption), '') IS NULL THEN 'ac_caption 为空; ' ELSE '' END) ||
-        (CASE WHEN NULLIF(TRIM(description), '') IS NULL THEN 'description 为空; ' ELSE '' END) ||
         (CASE WHEN rc_amount IS NULL THEN 'rc_amount 无法转换或借贷标识无法识别; ' ELSE '' END)
     )
     """.strip()

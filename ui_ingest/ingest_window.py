@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -16,10 +17,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QInputDialog,
     QPushButton,
     QCheckBox,
     QComboBox,
     QSpinBox,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -27,11 +30,22 @@ from PySide6.QtWidgets import (
 )
 
 from ingest.import_service import ImportService
-from ingest.client_profile_service import find_profile, save_profile
+from ingest.client_profile_service import load_profiles_from_path, save_profile
 from ingest.mapping_service import auto_detect_mapping
+from ingest.profile_validation import validate_profile_mapping
+from shared.constants import COMMON_FIELD_ALIASES
+from shared.errors import ADEError
 from shared.schema import AmountRules, ImportRequest, IngestProfile, LedgerFieldMapping
 from ui_ingest.import_report_view import ImportReportView
 from ui_ingest.mapping_dialog import MappingDialog
+
+
+class LockedWheelComboBox(QComboBox):
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        if self.view().isVisible():
+            super().wheelEvent(event)
+            return
+        event.ignore()
 
 
 class PreviewWorker(QObject):
@@ -69,6 +83,9 @@ class PreviewWorker(QObject):
 
 
 class IngestWindow(QMainWindow):
+    _DEFAULT_REQUIRED_FIELDS = ["posting_date", "voucher_id", "ac_code", "ac_caption", "description"]
+    _DEFAULT_MANUAL_BASELINE = Path("profile") / "ingest_profiles_baseline_不使用配置.toml"
+
     def __init__(self, on_back_to_main: Callable[[], None] | None = None) -> None:
         super().__init__()
         self.setWindowTitle("ADE Pro Ingest · 数据集转换")
@@ -78,7 +95,6 @@ class IngestWindow(QMainWindow):
         self.entry_window = None
 
         self.import_service = ImportService()
-        self.field_mapping = None
         self.ingest_profile = None
         self.inline_mapping_combos: list[QComboBox] = []
         self.preview_columns: list[str] = []
@@ -86,17 +102,25 @@ class IngestWindow(QMainWindow):
         self.preview_loaded = False
         self.preview_thread: QThread | None = None
         self.preview_worker: PreviewWorker | None = None
+        self.selected_baseline_profile: IngestProfile | None = None
+        self.selected_profile_path: Path | None = None
 
         self.client_name_edit = QLineEdit()
         self.client_name_edit.setPlaceholderText("如：某某有限公司")
         self.dataset_name_edit = QLineEdit()
         self.dataset_name_edit.setPlaceholderText("如：ABC 2024 Ledger")
-        self.source_type_combo = QComboBox()
-        self.source_type_combo.addItems(["excel", "csv", "duckdb", "parquet"])
+        self.source_type_combo = LockedWheelComboBox()
+        self.source_type_combo.addItems(["excel", "csv"])
+        self.profile_mode_combo = LockedWheelComboBox()
+        self.profile_mode_combo.addItem("使用配置文件", "profile")
+        self.profile_mode_combo.addItem("不使用配置", "manual")
+        self.profile_file_combo = LockedWheelComboBox()
+        self.profile_file_combo.addItem("请先选择配置文件")
+        self.profile_browse_button = QPushButton("选择配置文件")
         self.file_path_edit = QLineEdit()
         self.file_path_edit.setReadOnly(True)
         self.browse_button = QPushButton("选择文件")
-        self.sheet_combo = QComboBox()
+        self.sheet_combo = LockedWheelComboBox()
         self.sheet_combo.setEnabled(False)
         self.sheet_combo.addItem("请先选择 Excel 文件")
         self.mapping_button = QPushButton("确认字段与金额规则")
@@ -106,10 +130,10 @@ class IngestWindow(QMainWindow):
         self.fiscal_year_spin = QSpinBox()
         self.fiscal_year_spin.setRange(2000, 2100)
         self.fiscal_year_spin.setValue(datetime.now().year)
-        self.import_mode_combo = QComboBox()
+        self.import_mode_combo = LockedWheelComboBox()
         self.import_mode_combo.addItem("新导入（覆盖该客户该年度）", "new")
         self.import_mode_combo.addItem("追加导入（保留原数据）", "append")
-        self.duplicate_mode_combo = QComboBox()
+        self.duplicate_mode_combo = LockedWheelComboBox()
         self.duplicate_mode_combo.addItems(["mark", "skip", "strict"])
         self.mapping_status_label = QLabel("尚未确认字段映射；可先在预览表第一行选择目标字段")
         self.profile_status_label = QLabel("未匹配客户 profile")
@@ -130,6 +154,11 @@ class IngestWindow(QMainWindow):
 
         step1_form = QFormLayout()
         step1_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        step1_form.addRow("配置方式", self.profile_mode_combo)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(self.profile_file_combo)
+        profile_row.addWidget(self.profile_browse_button)
+        step1_form.addRow("配置文件", profile_row)
         step1_form.addRow("来源类型", self.source_type_combo)
 
         file_row = QHBoxLayout()
@@ -176,7 +205,11 @@ class IngestWindow(QMainWindow):
         layout.addLayout(action_row)
         layout.addWidget(QLabel("导入报告"))
         layout.addWidget(self.report_view)
-        self.setCentralWidget(root)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(root)
+        self.setCentralWidget(scroll)
 
         self._apply_style()
 
@@ -184,10 +217,15 @@ class IngestWindow(QMainWindow):
         self.client_name_edit.textChanged.connect(self._sync_default_dataset_name)
         self.fiscal_year_spin.valueChanged.connect(self._sync_default_dataset_name)
         self.source_type_combo.currentTextChanged.connect(self.on_source_type_changed)
+        self.profile_mode_combo.currentTextChanged.connect(self.on_profile_mode_changed)
+        self.profile_file_combo.currentTextChanged.connect(self.on_profile_file_changed)
+        self.profile_browse_button.clicked.connect(self.on_profile_browse)
         self.sheet_combo.currentTextChanged.connect(self.on_sheet_changed)
         self.mapping_button.clicked.connect(self.on_mapping)
         self.import_button.clicked.connect(self.on_import)
         self.back_button.clicked.connect(self.on_back)
+        if self.profile_mode_combo.currentData() == "manual":
+            self._load_default_manual_baseline()
 
     def _sync_default_dataset_name(self) -> None:
         if self.dataset_name_edit.text().strip():
@@ -196,6 +234,82 @@ class IngestWindow(QMainWindow):
         if not client_name:
             return
         self.dataset_name_edit.setPlaceholderText(f"{client_name} {self.fiscal_year_spin.value()} Ledger")
+
+    def on_profile_mode_changed(self) -> None:
+        is_profile = self.profile_mode_combo.currentData() == "profile"
+        self.profile_file_combo.setEnabled(is_profile)
+        self.profile_browse_button.setEnabled(is_profile)
+        if is_profile:
+            self.selected_baseline_profile = None
+            self.selected_profile_path = None
+        else:
+            self._load_default_manual_baseline()
+        if not is_profile:
+            self.profile_status_label.setText("不使用配置文件，将按手动映射导入")
+        if self.preview_loaded:
+            self._apply_initial_inline_mapping()
+
+    def on_profile_file_changed(self) -> None:
+        if self.profile_mode_combo.currentData() != "profile":
+            return
+        self.selected_baseline_profile = self._load_selected_profile_from_combo()
+        if self.selected_baseline_profile is None:
+            self.profile_status_label.setText("未加载配置文件")
+        else:
+            self.profile_status_label.setText(f"已加载配置：{self.selected_baseline_profile.profile_name}")
+        if self.preview_loaded:
+            self._apply_initial_inline_mapping()
+
+    def on_profile_browse(self) -> None:
+        path_text, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择配置文件",
+            str((Path.cwd() / "profile").resolve()),
+            "TOML (*.toml)",
+        )
+        if not path_text:
+            return
+        path = Path(path_text)
+        self.selected_profile_path = path
+        self._refresh_profile_combo(path)
+        self.selected_baseline_profile = self._load_selected_profile_from_combo()
+        if self.selected_baseline_profile is None:
+            QMessageBox.warning(self, "配置无效", "未能从配置文件加载 profile。")
+            return
+        self.profile_status_label.setText(f"已加载配置：{self.selected_baseline_profile.profile_name}")
+        if self.preview_loaded:
+            self._apply_initial_inline_mapping()
+
+    def _refresh_profile_combo(self, path: Path) -> None:
+        profiles = load_profiles_from_path(path)
+        self.profile_file_combo.blockSignals(True)
+        self.profile_file_combo.clear()
+        if not profiles:
+            self.profile_file_combo.addItem("配置文件中没有 profile")
+        else:
+            for profile in profiles:
+                self.profile_file_combo.addItem(profile.profile_name)
+        self.profile_file_combo.blockSignals(False)
+
+    def _load_selected_profile_from_combo(self) -> IngestProfile | None:
+        if self.selected_profile_path is None:
+            return None
+        profiles = load_profiles_from_path(self.selected_profile_path)
+        if not profiles:
+            return None
+        name = self.profile_file_combo.currentText().strip()
+        if not name:
+            return profiles[0]
+        for profile in profiles:
+            if profile.profile_name == name:
+                return profile
+        return profiles[0]
+
+    def _load_default_manual_baseline(self) -> None:
+        path = (Path.cwd() / self._DEFAULT_MANUAL_BASELINE).resolve()
+        self.selected_profile_path = path
+        profiles = load_profiles_from_path(path)
+        self.selected_baseline_profile = profiles[0] if profiles else None
 
     def on_back(self) -> None:
         if self.on_back_to_main is not None:
@@ -297,7 +411,6 @@ class IngestWindow(QMainWindow):
         self.preview_loaded = False
         self.preview_columns = []
         self.preview_rows = []
-        self.field_mapping = None
         self.ingest_profile = None
         self.inline_mapping_combos = []
         self.preview_table.clear()
@@ -305,7 +418,10 @@ class IngestWindow(QMainWindow):
         self.preview_table.setColumnCount(0)
         self.mapping_button.setEnabled(False)
         self.mapping_status_label.setText("尚未确认字段映射；可先在预览表第一行选择目标字段")
-        self.profile_status_label.setText("未匹配客户 profile")
+        if self.profile_mode_combo.currentData() == "manual":
+            self.profile_status_label.setText("不使用配置文件，将按手动映射导入")
+        else:
+            self.profile_status_label.setText("未加载配置文件")
 
     def _set_preview_busy(self, busy: bool) -> None:
         if busy:
@@ -359,11 +475,6 @@ class IngestWindow(QMainWindow):
         return "append"
 
     def _sync_import_mode_by_source(self) -> None:
-        if self.source_type_combo.currentText() == "duckdb":
-            self.import_mode_combo.setCurrentIndex(self.import_mode_combo.findData("append"))
-            self.import_mode_combo.setEnabled(False)
-            self.statusBar().showMessage("DuckDB 仅支持追加导入。")
-            return
         self.import_mode_combo.setEnabled(True)
 
     def _reset_sheet_selector(self, placeholder: str) -> None:
@@ -412,9 +523,11 @@ class IngestWindow(QMainWindow):
         self.preview_table.setRowCount(len(rows) + 1)
         self.inline_mapping_combos = []
 
+        options = self._current_mapping_options(self.selected_baseline_profile)
         for col_index, _header in enumerate(headers):
-            combo = QComboBox()
-            combo.addItems(_mapping_options())
+            combo = LockedWheelComboBox()
+            combo.addItems(options)
+            combo.currentTextChanged.connect(lambda text, c=combo: self._on_mapping_combo_changed(c, text))
             self.preview_table.setCellWidget(0, col_index, combo)
             self.inline_mapping_combos.append(combo)
 
@@ -430,19 +543,16 @@ class IngestWindow(QMainWindow):
         self.preview_table.horizontalHeader().setStretchLastSection(True)
 
     def _apply_initial_inline_mapping(self) -> None:
-        profile = None
-        client_name = self.client_name_edit.text().strip()
-        if client_name:
-            profile = find_profile(
-                client_name,
-                self.source_type_combo.currentText(),
-                self._selected_sheet(),
-                self.preview_columns,
-            )
+        profile = self.selected_baseline_profile
         if profile is not None:
-            self._set_inline_mapping_from_profile(profile)
-            self.mapping_status_label.setText(f"已自动匹配 profile：{profile.profile_name}")
-            self.profile_status_label.setText(f"已匹配：{profile.profile_name}")
+            unresolved = self._set_inline_mapping_from_profile(profile)
+            if unresolved:
+                self.mapping_status_label.setText(
+                    f"已从配置预填：{profile.profile_name}；仍需手动映射：{', '.join(unresolved)}"
+                )
+            else:
+                self.mapping_status_label.setText(f"已从配置预填：{profile.profile_name}")
+            self.profile_status_label.setText(f"已加载配置：{profile.profile_name}")
             return
 
         detected = auto_detect_mapping(self.preview_columns)
@@ -460,34 +570,93 @@ class IngestWindow(QMainWindow):
             target = source_to_target.get(column)
             if target:
                 combo.setCurrentText(target)
-        self.profile_status_label.setText("未匹配 profile，已按字段别名自动识别")
+        self.profile_status_label.setText("未使用配置，已按字段别名自动识别")
 
-    def _set_inline_mapping_from_profile(self, profile: IngestProfile) -> None:
-        source_to_target: dict[str, str] = {}
-        for target, source in profile.field_mapping.__dict__.items():
+    def _set_inline_mapping_from_profile(self, profile: IngestProfile) -> list[str]:
+        source_to_target_raw: dict[str, str] = {}
+        for field_def in fields(LedgerFieldMapping):
+            target = field_def.name
+            source = getattr(profile.field_mapping, target, None)
             if isinstance(source, str) and source:
-                source_to_target[source] = target
+                source_to_target_raw[source] = target
         rules = profile.amount_rules
         if rules.direct_amount_field:
-            source_to_target[rules.direct_amount_field] = "rc_amount"
+            source_to_target_raw[rules.direct_amount_field] = "rc_amount"
         if rules.amount_field:
-            source_to_target[rules.amount_field] = "amount"
+            source_to_target_raw[rules.amount_field] = "amount"
         if rules.drcr_field:
-            source_to_target[rules.drcr_field] = "drcr"
+            source_to_target_raw[rules.drcr_field] = "drcr"
         if rules.debit_field:
-            source_to_target[rules.debit_field] = "debit_amount"
+            source_to_target_raw[rules.debit_field] = "debit_amount"
         if rules.credit_field:
-            source_to_target[rules.credit_field] = "credit_amount"
-        for column, combo in zip(self.preview_columns, self.inline_mapping_combos):
-            target = source_to_target.get(column)
-            if target and target in _mapping_options():
+            source_to_target_raw[rules.credit_field] = "credit_amount"
+
+        available_columns = {column: index for index, column in enumerate(self.preview_columns)}
+        normalized_columns = {_normalize_name(column): column for column in self.preview_columns}
+        mapped_targets: set[str] = set()
+
+        options = self._current_mapping_options(profile)
+        for source_name, target in source_to_target_raw.items():
+            if target not in options:
+                continue
+            chosen_column: str | None = None
+            if source_name in available_columns:
+                chosen_column = source_name
+            else:
+                normalized_source = _normalize_name(source_name)
+                chosen_column = normalized_columns.get(normalized_source)
+            if chosen_column is None:
+                continue
+            combo_index = available_columns[chosen_column]
+            combo = self.inline_mapping_combos[combo_index]
+            self._ensure_combo_option(combo, target)
+            combo.setCurrentText(target)
+            mapped_targets.add(target)
+
+        alias_to_target = {
+            "book_date": "posting_date",
+            "voucher_no": "voucher_id",
+            "ac_code": "ac_code",
+            "ac_name": "ac_caption",
+            "summary": "description",
+            "direct_amount": "rc_amount",
+            "debit": "debit_amount",
+            "credit": "credit_amount",
+        }
+        for alias_key, target in alias_to_target.items():
+            if target in mapped_targets:
+                continue
+            aliases = COMMON_FIELD_ALIASES.get(alias_key, [])
+            chosen_column: str | None = None
+            for alias in aliases:
+                if alias in available_columns:
+                    chosen_column = alias
+                    break
+                normalized_alias = _normalize_name(alias)
+                chosen_column = normalized_columns.get(normalized_alias)
+                if chosen_column is not None:
+                    break
+            if chosen_column is None:
+                continue
+            combo_index = available_columns[chosen_column]
+            combo = self.inline_mapping_combos[combo_index]
+            if combo.currentText() == "不导入":
+                self._ensure_combo_option(combo, target)
                 combo.setCurrentText(target)
+                mapped_targets.add(target)
+
+        missing_required: list[str] = []
+        required_targets = profile.required_field or list(self._DEFAULT_REQUIRED_FIELDS)
+        for required_target in required_targets:
+            if required_target not in mapped_targets:
+                missing_required.append(required_target)
+        return missing_required
 
     def _profile_from_inline_mapping(self, initial_profile: IngestProfile | None = None) -> IngestProfile:
         target_to_source: dict[str, str] = {}
         for column, combo in zip(self.preview_columns, self.inline_mapping_combos):
             target = combo.currentText()
-            if target and target != "不导入":
+            if target and target not in {"不导入", "其他输入"}:
                 target_to_source[target] = column
 
         mapping = LedgerFieldMapping(
@@ -499,7 +668,7 @@ class IngestWindow(QMainWindow):
             voucher_header=target_to_source.get("voucher_header"),
             company_id=target_to_source.get("company_id"),
             drcr=target_to_source.get("drcr"),
-            rc_amount=target_to_source.get("rc_amount") or target_to_source.get("amount"),
+            rc_amount=target_to_source.get("rc_amount"),
             lc_amount=target_to_source.get("lc_amount"),
             vendor_id=target_to_source.get("vendor_id"),
             vendor_name=target_to_source.get("vendor_name"),
@@ -540,12 +709,14 @@ class IngestWindow(QMainWindow):
             profile_name=profile_name,
             field_mapping=mapping,
             amount_rules=amount_rules,
+            required_field=list(initial_profile.required_field) if initial_profile is not None else list(self._DEFAULT_REQUIRED_FIELDS),
+            field_rules=dict(initial_profile.field_rules) if initial_profile is not None else {},
             source_type=self.source_type_combo.currentText(),
             source_sheet=self._selected_sheet(),
         )
 
     def on_browse(self) -> None:
-        filters = "All Supported (*.xlsx *.csv *.duckdb);;Excel (*.xlsx);;CSV (*.csv);;DuckDB (*.duckdb)"
+        filters = "All Supported (*.xlsx *.csv);;Excel (*.xlsx);;CSV (*.csv)"
         file_path, _ = QFileDialog.getOpenFileName(self, "选择来源文件", str(Path.cwd()), filters)
         if not file_path:
             return
@@ -569,7 +740,6 @@ class IngestWindow(QMainWindow):
             return
 
         self.preview_loaded = False
-        self.field_mapping = None
         self.mapping_button.setEnabled(False)
         self.mapping_status_label.setText("尚未确认字段映射")
 
@@ -598,15 +768,12 @@ class IngestWindow(QMainWindow):
             QMessageBox.warning(self, "缺少预览", "请先读取前10行预览。")
             return
         try:
-            initial_profile = None
-            client_name = self.client_name_edit.text().strip()
-            if client_name:
-                initial_profile = find_profile(
-                    client_name,
-                    self.source_type_combo.currentText(),
-                    self._selected_sheet(),
-                    self.preview_columns,
-                )
+            if self.ingest_profile is not None:
+                initial_profile = self.ingest_profile
+            elif self.profile_mode_combo.currentData() == "profile":
+                initial_profile = self.selected_baseline_profile
+            else:
+                initial_profile = self.selected_baseline_profile
             inline_profile = self._profile_from_inline_mapping(initial_profile)
             dialog = MappingDialog(
                 self.preview_columns,
@@ -619,12 +786,45 @@ class IngestWindow(QMainWindow):
                     self.source_type_combo.currentText(),
                     self._selected_sheet(),
                 )
-                self.field_mapping = dialog.mapping()
-                self._save_profile_if_requested(client_name, self.ingest_profile)
-                self.mapping_status_label.setText(f"已确认字段映射：{self.ingest_profile.profile_name}")
+                self._apply_mapping_to_inline_combos(self.ingest_profile)
+                unresolved, _ = validate_profile_mapping(self.ingest_profile)
+                if unresolved:
+                    self.mapping_status_label.setText(
+                        f"已确认字段映射：{self.ingest_profile.profile_name}；仍需手动映射：{', '.join(unresolved)}"
+                    )
+                else:
+                    self.mapping_status_label.setText(f"已确认字段映射：{self.ingest_profile.profile_name}")
                 self.statusBar().showMessage("字段映射与金额规则已确认，可生成标准数据集。")
+        except ADEError as exc:
+            QMessageBox.warning(self, "配置校验失败", str(exc))
         except Exception as exc:
-            QMessageBox.critical(self, "读取失败", str(exc))
+            QMessageBox.critical(self, "读取失败", f"系统异常：{exc}")
+
+    def _apply_mapping_to_inline_combos(self, profile: IngestProfile) -> None:
+        source_to_target: dict[str, str] = {}
+        for field_def in fields(LedgerFieldMapping):
+            target = field_def.name
+            source = getattr(profile.field_mapping, target, None)
+            if isinstance(source, str) and source:
+                source_to_target[source] = target
+        rules = profile.amount_rules
+        if rules.mode == "direct_signed_amount" and rules.direct_amount_field:
+            source_to_target[rules.direct_amount_field] = "rc_amount"
+        if rules.mode == "amount_with_drcr":
+            if rules.amount_field:
+                source_to_target[rules.amount_field] = "amount"
+            if rules.drcr_field:
+                source_to_target[rules.drcr_field] = "drcr"
+        if rules.mode == "debit_credit_columns":
+            if rules.debit_field:
+                source_to_target[rules.debit_field] = "debit_amount"
+            if rules.credit_field:
+                source_to_target[rules.credit_field] = "credit_amount"
+
+        for column, combo in zip(self.preview_columns, self.inline_mapping_combos):
+            target = source_to_target.get(column, "不导入")
+            self._ensure_combo_option(combo, target)
+            combo.setCurrentText(target)
 
     def _save_profile_if_requested(self, client_name: str, profile: IngestProfile) -> None:
         if not self.save_profile_checkbox.isChecked():
@@ -649,17 +849,20 @@ class IngestWindow(QMainWindow):
         if not self.preview_loaded:
             QMessageBox.warning(self, "缺少预览", "请先读取前10行预览。")
             return
-        if self.field_mapping is None:
-            QMessageBox.warning(self, "缺少字段映射", "请先完成字段映射。")
-            return
         if self.ingest_profile is None:
             QMessageBox.warning(self, "缺少金额规则", "请先完成字段映射与金额规则。")
             return
+        required_missing, amount_missing = validate_profile_mapping(self.ingest_profile)
+        if required_missing or amount_missing:
+            lines: list[str] = []
+            if required_missing:
+                lines.append(f"非金额必需字段未映射: {', '.join(required_missing)}")
+            if amount_missing:
+                lines.append(f"金额规则缺失: {', '.join(amount_missing)}")
+            QMessageBox.warning(self, "必需映射未完成", "\n".join(lines))
+            return
 
         import_mode = self._selected_import_mode()
-        if self.source_type_combo.currentText() == "duckdb" and import_mode != "append":
-            QMessageBox.warning(self, "导入方式不支持", "DuckDB 来源仅支持追加导入。")
-            return
         mode_label = "新导入（覆盖）" if import_mode == "new" else "追加导入"
         confirm_message = (
             "即将按当前配置执行全量转换并生成标准数据集。\n"
@@ -685,17 +888,17 @@ class IngestWindow(QMainWindow):
             return
 
         try:
+            self._save_profile_if_requested(self.client_name_edit.text().strip(), self.ingest_profile)
             result = self.import_service.import_to_client_db(
                 ImportRequest(
                     client_name=self.client_name_edit.text().strip(),
                     source_type=self.source_type_combo.currentText(),
                     source_path=Path(self.file_path_edit.text()),
                     fiscal_year=self.fiscal_year_spin.value(),
-                    field_mapping=self.field_mapping,
+                    profile=self.ingest_profile,
                     import_mode=import_mode,
                     duplicate_mode=self.duplicate_mode_combo.currentText(),
                     source_sheet=self._selected_sheet(),
-                    profile=self.ingest_profile,
                     dataset_name=self._dataset_name(),
                 )
             )
@@ -705,8 +908,10 @@ class IngestWindow(QMainWindow):
                 "转换完成",
                 f"成功生成 {result.success_rows} 行 ledger 数据。\n{result.dataset_path or ''}",
             )
+        except ADEError as exc:
+            QMessageBox.warning(self, "导入校验失败", str(exc))
         except Exception as exc:
-            QMessageBox.critical(self, "导入失败", str(exc))
+            QMessageBox.critical(self, "导入失败", f"系统异常：{exc}")
 
     def _dataset_name(self) -> str:
         explicit_name = self.dataset_name_edit.text().strip()
@@ -715,32 +920,37 @@ class IngestWindow(QMainWindow):
         client_name = self.client_name_edit.text().strip()
         return f"{client_name} {self.fiscal_year_spin.value()} Ledger"
 
+    def _current_mapping_options(self, profile: IngestProfile | None) -> list[str]:
+        options: list[str] = ["不导入", "其他输入"]
+        seen = set(options)
+        targets: list[str] = []
+        if profile is not None:
+            targets.extend(profile.required_field or [])
+            targets.extend(field_def.name for field_def in fields(LedgerFieldMapping))
+        else:
+            targets.extend(self._DEFAULT_REQUIRED_FIELDS)
+            targets.extend(field_def.name for field_def in fields(LedgerFieldMapping))
+        targets.extend(["amount", "debit_amount", "credit_amount", "drcr", "rc_amount"])
+        for target in targets:
+            if target and target not in seen:
+                options.append(target)
+                seen.add(target)
+        return options
 
-def _mapping_options() -> list[str]:
-    return [
-        "不导入",
-        "posting_date",
-        "voucher_id",
-        "ac_code",
-        "ac_caption",
-        "description",
-        "rc_amount",
-        "amount",
-        "drcr",
-        "debit_amount",
-        "credit_amount",
-        "voucher_header",
-        "company_id",
-        "lc_amount",
-        "vendor_id",
-        "vendor_name",
-        "customer_id",
-        "customer_name",
-        "department",
-        "employee_id",
-        "employee_name",
-        "currency",
-        "document_type",
-        "posting_period",
-        "source_system",
-    ]
+    def _ensure_combo_option(self, combo: QComboBox, text: str) -> None:
+        if combo.findText(text) < 0:
+            combo.addItem(text)
+
+    def _on_mapping_combo_changed(self, combo: QComboBox, text: str) -> None:
+        if text != "其他输入":
+            return
+        value, ok = QInputDialog.getText(self, "输入字段名", "请输入目标字段名：")
+        custom = value.strip() if ok else ""
+        if not custom:
+            combo.setCurrentText("不导入")
+            return
+        self._ensure_combo_option(combo, custom)
+        combo.setCurrentText(custom)
+
+def _normalize_name(value: str) -> str:
+    return value.strip().lower().replace(" ", "").replace("_", "").replace("\u3000", "")

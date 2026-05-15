@@ -20,7 +20,7 @@ from ingest.import_service import ImportService
 from query.query_service import QueryService
 from query.sql_history_service import SQL_HISTORY_PATH, list_sql_history, record_sql_history
 from shared.client_router import resolve_client_dir
-from shared.schema import AmountRules, DatasetManifest, FieldMapping, ImportRequest, IngestProfile, LedgerFieldMapping
+from shared.schema import AmountRules, DatasetManifest, FieldMapping, FieldRule, ImportRequest, IngestProfile, LedgerFieldMapping
 
 
 TMP_DIR = ROOT / "data" / "_tmp_verify_ade_pro"
@@ -42,6 +42,7 @@ def main() -> None:
         verify_debit_credit_columns()
         verify_import_errors()
         verify_profile_save_and_match()
+        verify_field_prefix_rules()
         verify_sql_history()
         verify_bare_parquet_inspect_and_query()
         print("ADE Pro verification passed.")
@@ -160,6 +161,43 @@ def verify_profile_save_and_match() -> None:
         ["posting_date", "voucher_id", "ac_code", "ac_caption", "description", "amount"],
     )
     assert matched is not None and matched.profile_name == "verify-profile"
+
+
+def verify_field_prefix_rules() -> None:
+    source = TMP_DIR / "prefix.csv"
+    source.write_text(
+        "posting_date,voucher_id,ac_code,ac_caption,description,vendor_id,customer_id,amount\n"
+        "2024-01-02,001,1001,Cash,desc,88,99,120\n"
+        "2024-01-03,002,1002,Bank,,,,300\n",
+        encoding="utf-8",
+    )
+    profile = IngestProfile(
+        profile_name="verify-prefix",
+        source_type="csv",
+        field_mapping=LedgerFieldMapping(
+            posting_date="posting_date",
+            voucher_id="voucher_id",
+            ac_code="ac_code",
+            ac_caption="ac_caption",
+            description="description",
+            vendor_id="vendor_id",
+            customer_id="customer_id",
+            rc_amount="amount",
+        ),
+        amount_rules=AmountRules(mode="direct_signed_amount", direct_amount_field="amount"),
+        field_rules={
+            "voucher_id": FieldRule(prefix="v_"),
+            "ac_code": FieldRule(prefix="ac_"),
+            "vendor_id": FieldRule(prefix="s_"),
+            "customer_id": FieldRule(prefix="c_"),
+        },
+    )
+    result = ImportService().import_to_client_db(_request("VerifyDirectClient", source, profile, "Verify Prefix Dataset"))
+    rows = QueryService().run_sql(
+        Path(result.manifest_path),
+        "SELECT voucher_id, ac_code, vendor_id, customer_id FROM ledger ORDER BY voucher_id",
+    ).rows
+    assert rows == [("v_001", "ac_1001", "s_88", "c_99")]
 
 
 def verify_sql_history() -> None:

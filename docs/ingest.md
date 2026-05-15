@@ -2,7 +2,7 @@
 
 ## 导入目标
 
-ADE Pro 的导入模块负责把 Excel、CSV、DuckDB 或已有 Parquet 来源数据转换为标准 `ledger` Parquet 数据集包。导入过程必须完成字段映射、类型清洗、金额口径标准化、客户隔离校验、数据集固化和导入报告生成。
+ADE Pro 的导入模块负责把 Excel、CSV 来源数据转换为标准 `ledger` Parquet 数据集包。导入过程必须完成字段映射、类型清洗、金额口径标准化、客户隔离校验、数据集固化和导入报告生成。
 
 标准流程：
 
@@ -30,20 +30,21 @@ DuckDB ledger / journal views
 
 ## 分步导入
 
-1. 选择来源文件（Excel/CSV/DuckDB/Parquet）
+1. 选择来源文件（Excel/CSV）
 2. 若为 Excel，先确认 worksheet
-3. 输入客户、会计年度、导入方式（新导入/追加导入）与重复处理策略
-4. 读取前几行预览
-5. 在每个源列下方用下拉框选择目标标准字段
-6. 在金额规则区域选择源 Excel 的金额结构
-7. 系统生成 `rc_amount` 转换预览
-8. 校验 required 字段、金额字段和借贷标识规则
-9. 用户确认输出数据集名称和位置
-10. 用户确认后执行全量转换
-11. 生成 `ledger.parquet` 和 `dataset.toml`
-12. 注册为本机最近数据集
-13. 生成导入报告
-14. 可将映射、金额规则和清洗规则保存为客户配置或模板配置
+3. 选择配置方式（使用配置文件 / 不使用配置），并可从项目 `profile/` 目录选择配置文件
+4. 输入客户、会计年度、导入方式（新导入/追加导入）与重复处理策略
+5. 读取前几行预览
+6. 在每个源列下方用下拉框选择目标标准字段
+7. 在金额规则区域选择源 Excel 的金额结构
+8. 系统生成 `rc_amount` 转换预览
+9. 开始转换前统一校验 `required_field`（非金额）和 `amount_rules`（金额）规则
+10. 用户确认输出数据集名称和位置
+11. 用户确认后执行全量转换
+12. 生成 `ledger.parquet` 和 `dataset.toml`
+13. 注册为本机最近数据集
+14. 生成导入报告
+15. 可选择保存本次映射、金额规则和清洗规则到客户配置
 
 说明：
 
@@ -51,12 +52,14 @@ DuckDB ledger / journal views
 - 预览与全量导入使用同一 worksheet，保证一致性
 - 表头下拉交互参考 excel-converter，但实现仍放在 ADE Pro 的 PySide6 体系内
 - Excel 导入和清洗主链路优先复用 Ledger Analysis 的 DuckDB 方法，不使用 pandas 作为导入和清洗主路径
+- 导入执行仅使用用户最终确认后的 `IngestProfile`（字段映射 + 金额规则）；baseline 仅用于预填
 
 ## 字段映射交互
 
 用户选择 Excel 后，系统展示前几行预览。每个源 Excel 列下面提供一个下拉框，选项包括：
 
 - 不导入
+- 其他输入（手工输入目标字段名）
 - `posting_date`
 - `voucher_id`
 - `ac_code`
@@ -74,9 +77,43 @@ DuckDB ledger / journal views
 4. 同一标准字段默认不允许被多个源列重复映射，除非该字段明确支持合并
 5. 映射结果可保存为客户或模板配置，供下次自动匹配
 
+UI 交互约束（当前实现）：
+
+- Step1、Step2、预览映射下拉、映射弹窗下拉（含金额规则）默认禁用鼠标滚轮改值，避免误触；仅在显式展开下拉时才响应滚轮
+- 映射弹窗支持右侧纵向滚动条（常显、加宽）
+- 点击映射弹窗 `OK` 后，映射结果会立即回写到预览第一行下拉；再次打开弹窗保留上次确认结果
+- 金额模式为 `amount_with_drcr` 时，预览映射显示目标字段为 `rc_amount`（不显示中间字段 `amount`）
+
 标准字段名称必须使用英文 `snake_case`。原始 Excel 中文列名只作为来源列名保存在 TOML 配置里，不进入 `ledger` schema。
 
-导入页在确认字段与金额规则时提供“保存为客户导入 profile”开关。默认保存到当前客户的 `ingest_profiles.toml`，用户也可以取消，只在本次导入使用当前映射和金额规则。
+导入页支持两种配置方式：
+
+- 使用配置文件：从项目 `profile/` 目录加载 baseline profile 作为预填
+- 不使用配置：默认加载 `profile/ingest_profiles_baseline_不使用配置.toml` 作为 baseline，并允许手动调整映射
+
+无论是否使用配置文件，开始转换前都必须完成 `required_field`（非金额）和 `amount_rules`（金额）映射；否则禁止开始转换。
+
+导入前校验提示分两段展示：
+
+- `required_field` 缺失项（非金额）
+- `amount_rules` 缺失项（金额规则）
+
+说明：转换前校验与后端执行使用同一份最终 `IngestProfile`，不会回退到旧映射对象。
+
+profile 中建议使用 `required_field` 明确“非金额必填字段”：
+
+```toml
+# required_field 为必填的非金额相关字段。
+# 系统必须在数据转换前检查这些字段是否已完成映射，缺失则报错并禁止转换。
+# 金额相关字段不在此列出；金额字段的校验由 amount_rules 单独执行。
+required_field = [
+  "posting_date",
+  "voucher_id",
+  "ac_code",
+  "ac_caption",
+  "description"
+]
+```
 
 ## 标准字段
 
@@ -207,6 +244,7 @@ FROM ledger;
 ## 金额规则
 
 `rc_amount` 是统一分析金额，转换后必须是一列：借方为正数，贷方为负数。金额规则不应只作为普通字段映射处理，而应在 GUI 中独立成“金额处理方式”配置区。
+金额规则校验与 `required_field` 分离：`required_field` 只校验非金额字段映射，金额字段由 `amount_rules` 单独校验。
 
 ### 支持的金额来源
 
@@ -255,6 +293,20 @@ FROM ledger;
 预览只需使用前几行数据，但校验应在全量导入时重新执行。
 
 ### 校验要求
+
+### 无效行过滤规则（当前实现）
+
+导入清洗阶段会在生成 `ledger` 前过滤无效行。当前仅在以下条件命中时过滤：
+
+- `voucher_id` 为空（去空格后）
+- `ac_code` 为空（去空格后）
+- `ac_caption` 为空（去空格后）
+- `rc_amount` 为空（金额无法转换，或借贷标识无法识别）
+
+说明：
+
+- `posting_date` 为空或无法解析：当前不作为过滤条件
+- `description` 为空：当前不作为过滤条件
 
 `direct_signed_amount`：
 
@@ -316,7 +368,6 @@ SELECT * FROM read_parquet('ledger.parquet');
 - 每次导入必须显式指定 `client_name`
 - 新导入支持按客户和会计年度覆盖
 - 追加导入保留历史数据并执行重复检测
-- DuckDB 来源优先作为追加导入处理
 - 导入前校验输出数据集目录与 `client_name` 一致
 - 导入过程中禁止跨客户写入
 - 发布数据集前必须校验 `ledger.parquet` required 字段
@@ -335,7 +386,6 @@ SELECT * FROM read_parquet('ledger.parquet');
 - 借贷平衡检查结果
 - `rc_amount` 统计（正/负/零）
 - `posting_date` 最早和最晚日期
-- 日期为空或无法解析行数
 - 行级错误明细，至少包含来源行号、错误原因、关键字段和转换后的金额
 - 金额方向规则
 - 重复处理模式（strict/skip/mark）及处理结果
@@ -355,9 +405,8 @@ SELECT * FROM read_parquet('ledger.parquet');
 
 1. 新导入：生成新的数据集包，并可替换该客户该年度当前数据集指针
 2. 追加导入：保留历史数据集或合并生成新的数据集包，按重复处理策略处理新增记录
-3. DuckDB 来源默认追加导入
-4. 系统保留内部 `import_batch_id` 用于审计追踪与问题定位
-5. UI 不要求用户输入批次号
+3. 系统保留内部 `import_batch_id` 用于审计追踪与问题定位
+4. UI 不要求用户输入批次号
 
 重复处理模式：strict / skip / mark（默认 mark）。
 

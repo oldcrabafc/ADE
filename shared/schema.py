@@ -56,10 +56,17 @@ class LedgerFieldMapping:
 
 
 @dataclass(slots=True)
+class FieldRule:
+    prefix: str | None = None
+
+
+@dataclass(slots=True)
 class IngestProfile:
     profile_name: str
     field_mapping: LedgerFieldMapping
     amount_rules: AmountRules
+    required_field: list[str] = field(default_factory=list)
+    field_rules: dict[str, FieldRule] = field(default_factory=dict)
     source_type: str = "excel"
     source_sheet: str | None = None
 
@@ -95,14 +102,13 @@ class ImportRequest:
     source_type: str
     source_path: Path
     fiscal_year: int
-    field_mapping: FieldMapping
+    profile: IngestProfile
     import_mode: str = "append"
     duplicate_mode: str = "mark"
     import_batch_id: str | None = None
     source_sheet: str | None = None
     source_table: str = "journal"
     target_table: str = "journal"
-    profile: IngestProfile | None = None
     dataset_name: str | None = None
 
 

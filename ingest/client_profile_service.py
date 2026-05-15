@@ -7,7 +7,7 @@ from typing import Any
 import tomllib
 
 from shared.client_router import resolve_client_dir
-from shared.schema import AmountRules, IngestProfile, LedgerFieldMapping
+from shared.schema import AmountRules, FieldRule, IngestProfile, LedgerFieldMapping
 
 
 def profile_path(client_name: str) -> Path:
@@ -16,6 +16,10 @@ def profile_path(client_name: str) -> Path:
 
 def load_client_profiles(client_name: str) -> list[IngestProfile]:
     path = profile_path(client_name)
+    return load_profiles_from_path(path)
+
+
+def load_profiles_from_path(path: Path) -> list[IngestProfile]:
     if not path.exists():
         return []
     with path.open("rb") as file:
@@ -26,12 +30,15 @@ def load_client_profiles(client_name: str) -> list[IngestProfile]:
             continue
         field_mapping = LedgerFieldMapping(**_clean_mapping(raw_profile.get("field_mapping", {})))
         amount_rules = AmountRules(**_clean_mapping(raw_profile.get("amount_rules", {})))
+        field_rules = _parse_field_rules(raw_profile.get("field_rules", {}))
         match = raw_profile.get("match", {}) if isinstance(raw_profile.get("match", {}), dict) else {}
         profiles.append(
             IngestProfile(
                 profile_name=str(raw_profile.get("profile_name", "default")),
                 field_mapping=field_mapping,
                 amount_rules=amount_rules,
+                required_field=_parse_required_field(raw_profile.get("required_field")),
+                field_rules=field_rules,
                 source_type=str(match.get("source_type", "excel")),
                 source_sheet=str(match["source_sheet"]) if match.get("source_sheet") else None,
             )
@@ -40,7 +47,19 @@ def load_client_profiles(client_name: str) -> list[IngestProfile]:
 
 
 def save_profile(client_name: str, profile: IngestProfile) -> Path:
-    profiles = [item for item in load_client_profiles(client_name) if item.profile_name != profile.profile_name]
+    existing_profiles = load_client_profiles(client_name)
+    existing_same_name = next((item for item in existing_profiles if item.profile_name == profile.profile_name), None)
+    if not profile.field_rules and existing_same_name and existing_same_name.field_rules:
+        profile = IngestProfile(
+            profile_name=profile.profile_name,
+            field_mapping=profile.field_mapping,
+            amount_rules=profile.amount_rules,
+            required_field=list(existing_same_name.required_field),
+            field_rules=dict(existing_same_name.field_rules),
+            source_type=profile.source_type,
+            source_sheet=profile.source_sheet,
+        )
+    profiles = [item for item in existing_profiles if item.profile_name != profile.profile_name]
     profiles.append(profile)
     path = profile_path(client_name)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,6 +116,9 @@ def _profiles_to_toml(profiles: list[IngestProfile]) -> str:
     for profile in profiles:
         lines.append("[[profiles]]")
         lines.append(f'profile_name = "{_escape(profile.profile_name)}"')
+        if profile.required_field:
+            items = ", ".join(f'"{_escape(item)}"' for item in profile.required_field)
+            lines.append(f"required_field = [{items}]")
         lines.append("")
         lines.append("[profiles.match]")
         lines.append(f'source_type = "{_escape(profile.source_type)}"')
@@ -114,8 +136,44 @@ def _profiles_to_toml(profiles: list[IngestProfile]) -> str:
             else:
                 lines.append(f'{key} = "{_escape(value or "")}"')
         lines.append("")
+        lines.append("[profiles.field_rules]")
+        for field_name, field_rule in sorted(profile.field_rules.items()):
+            if field_rule.prefix:
+                lines.append(f'{field_name}.prefix = "{_escape(field_rule.prefix)}"')
+        lines.append("")
     return "\n".join(lines)
 
 
 def _escape(value: object) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _parse_field_rules(value: Any) -> dict[str, FieldRule]:
+    if not isinstance(value, dict):
+        return {}
+    parsed: dict[str, FieldRule] = {}
+    for field_name, raw_rule in value.items():
+        if not isinstance(field_name, str):
+            continue
+        if isinstance(raw_rule, dict):
+            prefix = raw_rule.get("prefix")
+        else:
+            prefix = None
+        if prefix is None:
+            continue
+        prefix_text = str(prefix).strip()
+        if not prefix_text:
+            continue
+        parsed[field_name] = FieldRule(prefix=prefix_text)
+    return parsed
+
+
+def _parse_required_field(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    parsed: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if text:
+            parsed.append(text)
+    return parsed

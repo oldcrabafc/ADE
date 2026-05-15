@@ -2,7 +2,7 @@
 
 ## 产品定位
 
-ADE Pro 是本地优先的审计数据工作台。它把客户导出的 Excel、CSV、DuckDB 或 Parquet 数据转换为标准 `ledger` Parquet 数据集包，再用 DuckDB 连接数据集完成查询、基础规则分析、结果浏览、导出和分享。
+ADE Pro 是本地优先的财务数据工作台。它把导出的 Excel、CSV 数据转换为标准 `ledger` Parquet 数据集包，再用 DuckDB 连接数据集完成查询、基础规则分析、结果浏览、导出和分享。
 
 ```text
 原始数据
@@ -104,7 +104,8 @@ SELECT * FROM read_parquet('ledger.parquet');
 
 ## 导入链路
 
-当前导入链路不使用 pandas。Excel、CSV、DuckDB、Parquet 来源统一走 DuckDB 读取和清洗。
+当前导入链路不使用 pandas。Excel、CSV 来源统一走 DuckDB 读取和清洗。
+导入执行只使用“用户最终确认后的 `IngestProfile`”；baseline 与匹配信息仅用于预填。
 
 导入流程：
 
@@ -112,7 +113,7 @@ SELECT * FROM read_parquet('ledger.parquet');
 2. Excel 来源选择 worksheet。
 3. 读取前 10 行预览。
 4. 在预览表第一行选择标准字段映射。
-5. 打开字段映射对话框确认 required 字段、optional 字段和金额规则。
+5. 打开字段映射对话框确认 `required_field`（非金额）、optional 字段和金额规则。
 6. 可选择保存为客户 `ingest_profiles.toml`。
 7. 输入或确认数据集名称。
 8. DuckDB 清洗生成标准 `ledger`。
@@ -130,7 +131,8 @@ SELECT * FROM read_parquet('ledger.parquet');
 | `amount_with_drcr` | 借贷标识 + 正数金额 | 借方值转正，贷方值转负 |
 | `debit_credit_columns` | 借方金额列 + 贷方金额列 | 借方金额减贷方金额 |
 
-无法解析日期、必填字段为空、金额无法转换或借贷标识无法识别的行，会进入 `ImportResult.import_errors` 并在导入报告中展示。
+以下情况会进入 `ImportResult.import_errors` 并在导入报告中展示：`voucher_id` 为空、`ac_code` 为空、`ac_caption` 为空、金额无法转换或借贷标识无法识别（即 `rc_amount` 为空）。
+`posting_date` 和 `description` 当前不作为无效行过滤条件。
 
 ## 客户 Profile
 
@@ -147,7 +149,7 @@ profile 保存：
 - 金额模式和金额字段配置。
 - 借方值、贷方值配置。
 
-导入页会按 required 字段和金额规则字段匹配 profile。optional 字段不作为匹配必需列。
+导入页会按 `required_field`（非金额）和金额规则字段匹配 profile。optional 字段不作为匹配必需列。
 
 ## 查询与导出
 

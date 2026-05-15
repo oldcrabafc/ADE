@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -10,16 +12,27 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
 )
 
 from ingest.mapping_service import auto_detect_mapping
-from shared.schema import AmountRules, FieldMapping, IngestProfile, LedgerFieldMapping
+from shared.schema import AmountRules, IngestProfile, LedgerFieldMapping
+
+
+class LockedWheelComboBox(QComboBox):
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        if self.view().isVisible():
+            super().wheelEvent(event)
+            return
+        event.ignore()
 
 
 class MappingDialog(QDialog):
+    _DEFAULT_REQUIRED_FIELDS = ["posting_date", "voucher_id", "ac_code", "ac_caption", "description"]
+
     def __init__(
         self,
         columns: list[str],
@@ -29,7 +42,8 @@ class MappingDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Ledger 字段映射与金额规则")
-        self.resize(820, 760)
+        self.resize(900, 680)
+        self._initial_profile = initial_profile
         self.columns = [""] + columns
         self.source_columns = columns
         self.preview_rows = preview_rows or []
@@ -50,11 +64,41 @@ class MappingDialog(QDialog):
         self.vendor_name_combo = self._build_combo(initial_mapping.vendor_name if initial_mapping else None)
         self.customer_id_combo = self._build_combo(initial_mapping.customer_id if initial_mapping else None)
         self.customer_name_combo = self._build_combo(initial_mapping.customer_name if initial_mapping else None)
+        self._field_order = [
+            "posting_date",
+            "voucher_id",
+            "ac_code",
+            "ac_caption",
+            "description",
+            "voucher_header",
+            "company_id",
+            "lc_amount",
+            "vendor_id",
+            "vendor_name",
+            "customer_id",
+            "customer_name",
+        ]
+        self._field_widgets = {
+            "posting_date": self.posting_date_combo,
+            "voucher_id": self.voucher_id_combo,
+            "ac_code": self.ac_code_combo,
+            "ac_caption": self.ac_caption_combo,
+            "description": self.description_combo,
+            "voucher_header": self.voucher_header_combo,
+            "company_id": self.company_id_combo,
+            "lc_amount": self.lc_amount_combo,
+            "vendor_id": self.vendor_id_combo,
+            "vendor_name": self.vendor_name_combo,
+            "customer_id": self.customer_id_combo,
+            "customer_name": self.customer_name_combo,
+        }
+        initial_required = list(initial_profile.required_field) if initial_profile and initial_profile.required_field else []
+        self._required_fields = initial_required or list(self._DEFAULT_REQUIRED_FIELDS)
 
         amount_mode = initial_amount.mode if initial_amount else (
             "direct_signed_amount" if detected.direct_amount_field else "debit_credit_columns"
         )
-        self.amount_mode_combo = QComboBox()
+        self.amount_mode_combo = LockedWheelComboBox()
         self.amount_mode_combo.addItem("已是借正贷负净额", "direct_signed_amount")
         self.amount_mode_combo.addItem("借贷标识 + 正数金额", "amount_with_drcr")
         self.amount_mode_combo.addItem("借方金额列 + 贷方金额列", "debit_credit_columns")
@@ -77,22 +121,43 @@ class MappingDialog(QDialog):
         self.amount_preview_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.amount_preview_table.horizontalHeader().setStretchLastSection(True)
 
+        content = QVBoxLayout()
+        content.addWidget(self._profile_box())
+        content.addWidget(self._required_box())
+        content.addWidget(self._optional_box())
+        content.addWidget(self._amount_box())
+        content.addWidget(self._amount_preview_box())
+
+        content_widget = QGroupBox()
+        content_widget.setFlat(True)
+        content_widget.setLayout(content)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll.setWidget(content_widget)
+        scroll.setStyleSheet(
+            "QScrollBar:vertical { width: 24px; }"
+            "QScrollBar::handle:vertical { min-height: 36px; }"
+        )
+
         root = QVBoxLayout(self)
-        root.addWidget(self._profile_box())
-        root.addWidget(self._required_box())
-        root.addWidget(self._optional_box())
-        root.addWidget(self._amount_box())
-        root.addWidget(self._amount_preview_box())
+        root.addWidget(scroll)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            screen_h = screen.availableGeometry().height()
+            self.setMaximumHeight(max(520, int(screen_h * 0.9)))
         self._connect_preview_refresh()
         self.refresh_amount_preview()
 
     def _build_combo(self, current: str | None) -> QComboBox:
-        combo = QComboBox()
+        combo = LockedWheelComboBox()
         combo.addItems(self.columns)
         if current and current in self.columns:
             combo.setCurrentText(current)
@@ -107,47 +172,45 @@ class MappingDialog(QDialog):
     def _required_box(self) -> QGroupBox:
         box = QGroupBox("Required ledger 字段")
         form = QFormLayout(box)
-        form.addRow("posting_date", self.posting_date_combo)
-        form.addRow("voucher_id", self.voucher_id_combo)
-        form.addRow("ac_code", self.ac_code_combo)
-        form.addRow("ac_caption", self.ac_caption_combo)
-        form.addRow("description", self.description_combo)
+        shown: set[str] = set()
+        for field_name in self._required_fields:
+            widget = self._field_widgets.get(field_name)
+            if widget is None:
+                continue
+            form.addRow(field_name, widget)
+            shown.add(field_name)
+        for field_name in self._required_fields:
+            if field_name in shown:
+                continue
+            widget = self._field_widgets.get(field_name)
+            if widget is None:
+                continue
+            form.addRow(field_name, widget)
         return box
 
     def _optional_box(self) -> QGroupBox:
         box = QGroupBox("Optional ledger 字段")
         form = QFormLayout(box)
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("voucher_header"))
-        row1.addWidget(self.voucher_header_combo)
-        row1.addWidget(QLabel("company_id"))
-        row1.addWidget(self.company_id_combo)
-        form.addRow(row1)
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("lc_amount"))
-        row2.addWidget(self.lc_amount_combo)
-        row2.addWidget(QLabel("vendor_id"))
-        row2.addWidget(self.vendor_id_combo)
-        form.addRow(row2)
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("vendor_name"))
-        row3.addWidget(self.vendor_name_combo)
-        row3.addWidget(QLabel("customer_id"))
-        row3.addWidget(self.customer_id_combo)
-        form.addRow(row3)
-        row4 = QHBoxLayout()
-        row4.addWidget(QLabel("customer_name"))
-        row4.addWidget(self.customer_name_combo)
-        form.addRow(row4)
+        optional_fields = [field for field in self._field_order if field not in self._required_fields]
+        for index in range(0, len(optional_fields), 2):
+            row = QHBoxLayout()
+            for field_name in optional_fields[index : index + 2]:
+                widget = self._field_widgets.get(field_name)
+                if widget is None:
+                    continue
+                row.addWidget(QLabel(field_name))
+                row.addWidget(widget)
+            form.addRow(row)
         return box
 
     def _amount_box(self) -> QGroupBox:
         box = QGroupBox("金额规则：转换后 rc_amount 借方为正、贷方为负")
         form = QFormLayout(box)
+        form.addRow("规则说明", QLabel("amount + drcr -> rc_amount"))
         form.addRow("处理方式", self.amount_mode_combo)
         form.addRow("净额金额列", self.direct_amount_combo)
         form.addRow("借贷标识列", self.drcr_combo)
-        form.addRow("正数金额列", self.amount_combo)
+        form.addRow("正数金额列（amount）", self.amount_combo)
         form.addRow("借方金额列", self.debit_combo)
         form.addRow("贷方金额列", self.credit_combo)
         form.addRow("借方值", self.debit_values_edit)
@@ -240,27 +303,18 @@ class MappingDialog(QDialog):
             customer_id=self.customer_id_combo.currentText() or None,
             customer_name=self.customer_name_combo.currentText() or None,
         )
+        field_rules = {}
+        if hasattr(self, "_initial_profile") and self._initial_profile is not None:
+            field_rules = dict(self._initial_profile.field_rules)
         return IngestProfile(
             profile_name=self.profile_name_edit.text().strip() or "default",
             field_mapping=mapping,
             amount_rules=amount_rules,
+            required_field=list(self._required_fields),
+            field_rules=field_rules,
             source_type=source_type,
             source_sheet=source_sheet,
         )
-
-    def mapping(self) -> FieldMapping:
-        amount_mode = str(self.amount_mode_combo.currentData())
-        return FieldMapping(
-            book_date=self.posting_date_combo.currentText(),
-            voucher_no=self.voucher_id_combo.currentText(),
-            ac_name=self.ac_caption_combo.currentText(),
-            ac_code=self.ac_code_combo.currentText() or None,
-            summary=self.description_combo.currentText() or None,
-            debit_field=self.debit_combo.currentText() if amount_mode == "debit_credit_columns" else None,
-            credit_field=self.credit_combo.currentText() if amount_mode == "debit_credit_columns" else None,
-            direct_amount_field=self.direct_amount_combo.currentText() if amount_mode == "direct_signed_amount" else None,
-        )
-
 
 def _split_values(text: str) -> list[str]:
     return [item.strip() for item in text.split(",") if item.strip()]

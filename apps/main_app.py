@@ -5,11 +5,8 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
-    QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -28,42 +25,38 @@ class EntryWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("ADE 统一入口")
-        self.resize(520, 220)
+        self.resize(720, 320)
 
         self.next_window: QMainWindow | None = None
 
-        self.module_combo = QComboBox()
-        self.module_combo.addItem("导入模块", "ingest")
-        self.module_combo.addItem("查询模块", "query")
-
-        self.next_button = QPushButton("下一步")
-        self.next_button.clicked.connect(self.on_next)
-
-        title = QLabel("请选择下一步进入的模块")
+        title = QLabel("请选择要进入的模块")
         title.setStyleSheet("font-size: 18px; font-weight: 700; color: #1f2a37;")
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("模块"))
-        row.addWidget(self.module_combo)
+        self.ingest_button = QPushButton("进入数据导入模块")
+        self.query_button = QPushButton("进入数据查询模块")
+        self.ingest_button.setMinimumHeight(64)
+        self.query_button.setMinimumHeight(64)
+        self.ingest_button.setStyleSheet("font-size: 18px; font-weight: 700;")
+        self.query_button.setStyleSheet("font-size: 18px; font-weight: 700;")
+        self.ingest_button.clicked.connect(self.open_ingest)
+        self.query_button.clicked.connect(self.open_query)
 
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.addWidget(title)
-        layout.addLayout(row)
+        layout.addSpacing(8)
+        layout.addWidget(self.ingest_button)
+        layout.addWidget(self.query_button)
         layout.addStretch(1)
-        layout.addWidget(self.next_button)
         self.setCentralWidget(root)
 
-    def on_next(self) -> None:
-        choice = self.module_combo.currentData()
-        if choice == "ingest":
-            self.next_window = IngestWindow(on_back_to_main=self.show)
-        elif choice == "query":
-            self.next_window = QueryWindow(on_back_to_main=self.show)
-        else:
-            QMessageBox.warning(self, "选择无效", "请选择有效模块。")
-            return
+    def open_ingest(self) -> None:
+        self.next_window = IngestWindow(on_back_to_main=self.show)
+        self.next_window.show()
+        self.hide()
 
+    def open_query(self) -> None:
+        self.next_window = QueryWindow(on_back_to_main=self.show)
         self.next_window.show()
         self.hide()
 

@@ -4,11 +4,20 @@
 
 不同客户的 Excel/CSV 文件字段结构各不相同，包括列名、日期格式、金额格式、借贷标识和辅助核算字段。ADE Pro 允许为每个客户保存字段映射、金额规则和清洗规则，下次导入同一客户时自动匹配并预填映射，减少重复配置。
 
-配置统一使用 TOML，不使用 JSON。规则目标是把来源字段映射到标准 `ledger` 字段，而不是旧 `journal` 字段。
+配置统一使用 TOML，不使用 JSON。规则目标是把来源字段映射到标准 `ledger` 字段。
 
 ## 配置文件位置
 
-每个客户目录下存放一个 `ingest_profiles.toml`：
+导入 baseline 配置文件放在项目目录 `profile/` 下，例如：
+
+```text
+profile/ingest_profiles_baseline_供应链集团.toml
+profile/ingest_profiles_baseline_不使用配置.toml
+```
+
+其中 `profile/ingest_profiles_baseline_不使用配置.toml` 为默认 baseline。用户在导入页选择“不使用配置”时，系统加载该文件作为基线配置，随后允许用户在 UI 中手动调整映射。
+
+客户目录下仍可维护一个 `ingest_profiles.toml` 作为客户持久配置：
 
 ```text
 data/clients/client_{sha1[:8]}/ingest_profiles.toml
@@ -23,12 +32,23 @@ version = 2
 
 [[profiles]]
 profile_name = "default"
+# required_field 为必填的非金额相关字段。
+# 系统必须在数据转换前检查这些字段是否已完成映射，缺失则报错并禁止转换。
+# 金额相关字段不在此列出；金额字段的校验由 amount_rules 单独执行。
+required_field = [
+  "posting_date",
+  "voucher_id",
+  "ac_code",
+  "ac_caption",
+  "description",
+]
 
 [profiles.match]
 source_type = "excel"
 source_sheet = "Sheet1"
-required_columns = ["记账日期", "凭证号", "科目编码", "科目名称", "摘要"]
 
+# field_mapping 定义了系统需要识别的标准字段与源数据字段的对应关系。
+# 这个只是在进入UI后系统预设的默认映射，用户可以根据实际情况在UI里修改这些映射关系。
 [profiles.field_mapping]
 posting_date = "记账日期"
 voucher_id = "凭证号"
@@ -52,6 +72,27 @@ document_type = "单据类型"
 posting_period = "期间"
 source_system = "来源系统"
 
+# amount_rules 用于金额字段校验与 rc_amount 转换，独立于 required_field。
+# required_field 只校验“非金额字段是否已映射”。
+
+# mode 取值：
+# 1) direct_signed_amount
+#    - 必须映射：direct_amount_field（或 field_mapping.rc_amount）
+#    - 规则：源金额已带方向，直接写入 rc_amount
+#
+# 2) amount_with_drcr
+#    - 必须映射：amount_field + drcr_field（或 field_mapping.drcr）
+#    - 规则：借方值 -> +abs(amount)；贷方值 -> -abs(amount)
+#    - debit_values / credit_values 必须配置，且应覆盖源数据实际标识（如 S/H、借/贷、D/C）
+#
+# 3) debit_credit_columns
+#    - 必须映射：debit_field + credit_field
+#    - 规则：rc_amount = abs(debit) - abs(credit)
+#
+# 校验失败处理：
+# - 缺少 mode 对应必需字段 -> 转换前报错并禁止转换
+# - 借贷标识无法识别 / 金额无法解析 -> 该行 rc_amount 为空，进入错误明细
+
 [profiles.amount_rules]
 mode = "amount_with_drcr"
 amount_field = "发生额"
@@ -73,7 +114,7 @@ amount_remove_commas = true
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `source_type` | string | `excel` / `csv` / `duckdb` / `parquet` |
+| `source_type` | string | `excel` / `csv` |
 | `source_sheet` | string | Excel sheet 名称；非 Excel 时可为空字符串 |
 | `required_columns` | string[] | 源文件必须包含这些列名，才视为匹配成功 |
 
@@ -84,11 +125,17 @@ amount_remove_commas = true
 - `required_columns` 使用子集判断，源文件允许有额外列
 - 多个 profile 命中时，优先选择 `required_columns` 数量最多的 profile
 
+说明：`required_columns` 仅用于 profile 匹配，不等于转换前必填映射字段。
+
 ## 字段映射
 
 `field_mapping` 保存“标准 ledger 字段 -> 来源列名”的映射。未映射的 optional 字段可为空字符串或省略。
 
 金额字段有特殊规则：`rc_amount` 可以由 `amount_rules` 生成，不要求一定出现在普通 `field_mapping` 中。GUI 应把金额处理从普通字段映射中独立出来，避免用户同时把金额列映射到 `rc_amount` 又选择另一套金额转换规则。
+
+`required_field` 用于定义“非金额字段的转换前必填映射”。这些字段可以由 baseline 预填，也可以由用户在界面手动补齐；在点击开始转换前必须完成映射。
+
+在映射弹窗中，`Required ledger 字段` 的显示顺序按 TOML 中 `required_field` 原顺序展示。
 
 Required 字段：
 
@@ -126,6 +173,8 @@ Optional 字段：
 
 `amount_rules` 用于说明如何得到 `rc_amount`。转换后的 `rc_amount` 必须是一列金额：借方为正，贷方为负。
 
+金额校验与 `required_field` 分离：`required_field` 只管非金额字段，金额字段由 `amount_rules` 按模式校验。
+
 | 键 | 说明 |
 | --- | --- |
 | `mode` | `direct_signed_amount` / `amount_with_drcr` / `debit_credit_columns` |
@@ -144,6 +193,7 @@ Optional 字段：
 - `mode=amount_with_drcr` 时，必须存在 `amount_field` 和 `drcr_field`
 - `mode=debit_credit_columns` 时，必须存在 `debit_field` 和 `credit_field`
 - 如果金额依赖借贷标识，则标准字段 `drcr` 必须存在或可由 `drcr_field` 生成
+- 缺少当前模式必需金额字段时，必须在转换前报错并禁止转换
 
 三种模式的含义：
 
@@ -152,6 +202,28 @@ Optional 字段：
 | `direct_signed_amount` | 一列金额，已是借正贷负 | `rc_amount = amount` |
 | `amount_with_drcr` | 一列借贷标识 + 一列正数金额 | 借方 `abs(amount)`，贷方 `-abs(amount)` |
 | `debit_credit_columns` | 借方金额列 + 贷方金额列，均为正数 | `rc_amount = abs(debit) - abs(credit)` |
+
+## 无效行过滤规则（当前实现）
+
+导入清洗阶段会在生成 `ledger` 前过滤无效行。当前仅在以下条件命中时过滤：
+
+- `voucher_id` 为空（去空格后）
+- `ac_code` 为空（去空格后）
+- `ac_caption` 为空（去空格后）
+- `rc_amount` 为空（金额无法转换，或借贷标识无法识别）
+
+`posting_date` 和 `description` 当前不作为无效行过滤条件。
+
+## UI 行为说明（当前实现）
+
+- 映射下拉支持 `不导入`、`其他输入`、标准字段集合；选择 `其他输入` 时可手工输入目标字段名
+- Step1、Step2、预览映射行、映射弹窗（含金额规则）下拉默认禁用滚轮改值，避免误触
+- 映射弹窗右侧纵向滚动条常显并加宽，便于小屏操作
+- 点击映射弹窗 `OK` 后，会把映射结果回写到预览行；再次打开弹窗保留上次确认内容
+- 金额模式为 `amount_with_drcr` 时，预览映射显示目标字段为 `rc_amount`
+- 转换前校验分开提示：
+  - 非金额必需字段缺失（`required_field`）
+  - 金额规则缺失（`amount_rules`）
 
 ### 金额规则示例
 
@@ -237,9 +309,11 @@ last_opened_at = "2026-05-12T11:00:00"
 ```text
 用户选择文件 / Sheet
        ↓
+选择配置方式（使用配置文件 / 不使用配置）
+       ↓
 读取前几行预览
        ↓
-find_profile(client, type, sheet, columns)
+加载 baseline profile（可选）
        ↓
 表头下拉框预填映射
        ↓
@@ -249,7 +323,7 @@ find_profile(client, type, sheet, columns)
        ↓
 生成 rc_amount 转换预览
        ↓
-校验 required 字段
+校验 required_field（非金额） + amount_rules（金额）
        ↓
 保存 profile
        ↓
@@ -259,6 +333,8 @@ DuckDB 清洗并生成 ledger
        ↓
 注册最近数据集
 ```
+
+补充：导入执行只接受最终确认后的 `IngestProfile`。`field_mapping` 作为 profile 内部字段配置存在，但不存在独立旧接口回退路径。
 
 ## 实现文件建议
 

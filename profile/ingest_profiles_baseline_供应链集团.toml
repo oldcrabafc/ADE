@@ -1,0 +1,82 @@
+version = 2
+
+[[profiles]]
+profile_name = "baseline_供应链集团_default"
+
+# required_field 为必填的非金额相关字段。
+# 系统必须在数据转换前检查这些字段是否已完成映射，缺失则报错并禁止转换。
+# 金额相关字段（包括借贷标识、金额字段）不在此列出；金额字段的校验由 amount_rules 单独执行。
+required_field = [
+    "company_id",
+    "posting_date",
+    "voucher_id",
+    "ac_code",
+    "ac_caption",
+    "description",
+    "vendor_id",
+    "vendor_name",
+    "customer_id",
+    "customer_name",
+] 
+
+[profiles.match]
+source_type = "excel"
+source_sheet = "Sheet1"
+
+# field_mapping 定义了系统需要识别的标准字段与源数据字段的对应关系。
+# 这个只是在进入UI后系统预设的默认映射，用户可以根据实际情况在UI里修改这些映射关系。
+[profiles.field_mapping]
+company_id = ""
+posting_date = "过帐日期"
+voucher_id = "凭证编号"
+ac_code = "总帐帐目"
+ac_caption = ""
+description = ""
+drcr = "借/贷标识"
+rc_amount = "本位币金额"
+lc_amount = "总帐金额"
+vendor_id = "供应商"
+vendor_name = ""
+customer_id = "客户"
+customer_name = ""
+posting_period = ""
+source_system = ""
+
+# amount_rules 用于金额字段校验与 rc_amount 转换，独立于 required_field。
+# required_field 只校验“非金额字段是否已映射”。
+
+# mode 取值：
+# 1) direct_signed_amount
+#    - 必须映射：direct_amount_field（或 field_mapping.rc_amount）
+#    - 规则：源金额已带方向，直接写入 rc_amount
+#
+# 2) amount_with_drcr
+#    - 必须映射：amount_field + drcr_field（或 field_mapping.drcr）
+#    - 规则：借方值 -> +abs(amount)；贷方值 -> -abs(amount)
+#    - debit_values / credit_values 必须配置，且应覆盖源数据实际标识（如 S/H、借/贷、D/C）
+#
+# 3) debit_credit_columns
+#    - 必须映射：debit_field + credit_field
+#    - 规则：rc_amount = abs(debit) - abs(credit)
+#
+# 校验失败处理：
+# - 缺少 mode 对应必需字段 -> 转换前报错并禁止转换
+# - 借贷标识无法识别 / 金额无法解析 -> 该行 rc_amount 为空，进入错误明细
+
+[profiles.amount_rules]
+mode = "amount_with_drcr"
+direct_amount_field = "本位币金额"
+amount_field = "本位币金额"
+debit_field = ""
+credit_field = ""
+drcr_field = "借/贷标识"
+debit_values = ["S"]
+credit_values = ["H"]
+sign_rule = "debit_positive"
+
+[profiles.field_rules]
+ac_code.prefix = "ac_"
+customer_id.prefix = "c_"
+vendor_id.prefix = "s_"
+voucher_id.prefix = "v_"
+
